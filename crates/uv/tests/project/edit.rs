@@ -2,9 +2,7 @@
 
 #[cfg(feature = "test-git")]
 mod conditional_imports {
-    #[cfg(feature = "test-git-lfs")]
     pub(crate) use anyhow::anyhow;
-    #[cfg(feature = "test-git-lfs")]
     pub(crate) use uv_test::TestContext;
     pub(crate) use uv_test::{READ_ONLY_GITHUB_TOKEN, decode_token};
 }
@@ -20,8 +18,14 @@ use insta::assert_snapshot;
 use predicates::prelude::predicate;
 use serde_json::json;
 use std::path::Path;
+#[cfg(all(feature = "test-git-lfs", unix))]
+use std::sync::Arc;
 #[cfg(unix)]
 use std::{fs::Permissions, os::unix::fs::PermissionsExt};
+#[cfg(all(feature = "test-git-lfs", unix))]
+use tokio_rustls::TlsAcceptor;
+#[cfg(all(feature = "test-git-lfs", unix))]
+use tokio_rustls::rustls::{ServerConfig, pki_types::PrivatePkcs8KeyDer};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path},
@@ -38,7 +42,7 @@ use uv_static::EnvVars;
 use uv_test::package_server::PackageServer;
 use uv_test::{uv_snapshot, venv_bin_path};
 
-#[cfg(feature = "test-git-lfs")]
+#[cfg(feature = "test-git")]
 fn git(context: &TestContext, repository: &Path, arguments: &[&str]) -> Result<String> {
     let output = context
         .external_command("git")
@@ -1464,6 +1468,575 @@ fn git_lfs_submodule_missing_objects() -> Result<()> {
     Ok(())
 }
 
+#[cfg(all(feature = "test-git-lfs", unix))]
+fn https_proxy(
+    target: std::net::SocketAddr,
+) -> Result<(std::net::SocketAddr, tokio::sync::oneshot::Sender<()>)> {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+    listener.set_nonblocking(true)?;
+    let address = listener.local_addr()?;
+    let certificate = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_owned()])?;
+    let config = ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![certificate.cert.der().clone()],
+            PrivatePkcs8KeyDer::from(certificate.signing_key.serialize_der()).into(),
+        )?;
+    let acceptor = TlsAcceptor::from(Arc::new(config));
+    // Serve TLS on a separate runtime while synchronous test commands are running.
+    let (stop, shutdown) = tokio::sync::oneshot::channel::<()>();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    std::thread::spawn(move || {
+        runtime.block_on(async move {
+            let listener = tokio::net::TcpListener::from_std(listener)?;
+            tokio::select! {
+                () = async {
+                    while let Ok((stream, _)) = listener.accept().await {
+                        let acceptor = acceptor.clone();
+                        tokio::spawn(async move {
+                            if let Ok(mut stream) = acceptor.accept(stream).await
+                                && let Ok(mut target) = tokio::net::TcpStream::connect(target).await
+                            {
+                                let _ = tokio::io::copy_bidirectional(&mut stream, &mut target).await;
+                            }
+                        });
+                    }
+                } => {}
+                _ = shutdown => {}
+            }
+            Ok::<(), std::io::Error>(())
+        })
+    });
+    Ok((address, stop))
+}
+
+/// Apply TLS exceptions to the actual HTTPS LFS endpoint of an SSH Git source.
+#[tokio::test]
+#[cfg(all(feature = "test-git-lfs", unix))]
+async fn git_lfs_ssh_source_https_endpoint() -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let context = uv_test::test_context!("3.12")
+        .with_env("GIT_CONFIG_NOSYSTEM", "1")
+        .with_git_lfs_config();
+    let server = MockServer::start().await;
+    let (address, _shutdown) = https_proxy(*server.address())?;
+    let endpoint_host = address.to_string();
+    let endpoint = format!("https://{endpoint_host}/lfs");
+    let contents = b"VALUE = True\n";
+    let oid = hex::encode(Sha256::digest(contents));
+    Mock::given(method("POST"))
+        .and(path("/lfs/objects/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "transfer": "basic",
+            "objects": [{
+                "oid": oid,
+                "size": contents.len(),
+                "actions": {"download": {"href": format!("{endpoint}/object")}}
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lfs/object"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(contents.as_slice()))
+        .mount(&server)
+        .await;
+
+    let repository = context.temp_dir.child("repository");
+    repository.create_dir_all()?;
+    git(&context, repository.path(), &["init", "--template="])?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["lfs", "install", "--local", "--skip-repo"],
+    )?;
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+    "#})?;
+    repository
+        .child(".gitattributes")
+        .write_str("module.py filter=lfs diff=lfs merge=lfs -text\n")?;
+    repository
+        .child("module.py")
+        .write_str(str::from_utf8(contents)?)?;
+    git(&context, repository.path(), &["add", "."])?;
+    git(&context, repository.path(), &["commit", "-m", "LFS file"])?;
+    let revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let short_revision = git(
+        &context,
+        repository.path(),
+        &["rev-parse", "--short", "HEAD"],
+    )?;
+    let url = "ssh://git@127.0.0.1:2222/repository.git";
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency"]
+
+        [tool.uv.sources]
+        dependency = {{ git = "{url}", rev = "{revision}", lfs = true }}
+    "#})?;
+    let ssh = context.temp_dir.child("ssh");
+    ssh.write_str(indoc! {r#"
+        #!/bin/sh
+        for argument do
+            case "$argument" in
+                "git-upload-pack "*) exec git upload-pack "$UV_TEST_GIT_REPOSITORY" ;;
+            esac
+        done
+        exit 1
+    "#})?;
+    fs_err::set_permissions(ssh.path(), Permissions::from_mode(0o755))?;
+    let context = context
+        .with_env("GIT_SSH", ssh.path().as_os_str())
+        .with_env("GIT_SSH_VARIANT", "ssh")
+        .with_env("UV_TEST_GIT_REPOSITORY", repository.path().as_os_str())
+        .with_env("GIT_CONFIG_COUNT", "2")
+        .with_env("GIT_CONFIG_KEY_0", "lfs.url")
+        .with_env("GIT_CONFIG_VALUE_0", &endpoint)
+        .with_env("GIT_CONFIG_KEY_1", "lfs.transfer.maxretries")
+        .with_env("GIT_CONFIG_VALUE_1", "0")
+        .with_filter((regex::escape(&endpoint_host), "127.0.0.1:[PORT]"))
+        .with_filter((r"\b[0-9a-f]{40}\b", "[COMMIT]"))
+        .with_filter((
+            regex::escape(&which::which("git")?.to_string_lossy()),
+            "[GIT]",
+        ));
+    let mut filters = context.filters();
+    filters.retain(|(_, replacement)| *replacement != "[LOCALHOST]");
+
+    // The SSH port and an unrelated hostname must not exempt the HTTPS endpoint.
+    uv_snapshot!(filters, context.lock()
+        .args(["--no-preview", "--allow-insecure-host", "127.0.0.1:2222"]), @r#"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+ssh://git@127.0.0.1:2222/repository.git@[COMMIT]#lfs=true`
+      cause: Git operation failed
+      cause: failed to fetch LFS objects at [COMMIT]
+      cause: process didn't exit successfully: `[GIT] lfs fetch 'ssh://git@127.0.0.1:2222/repository.git' [COMMIT]` (exit status: 2)
+             --- stderr
+             Fetching reference [COMMIT]
+             batch response: Post "https://127.0.0.1:[PORT]/lfs/objects/batch": tls: failed to verify certificate: x509: certificate signed by unknown authority
+             error: failed to fetch some objects from 'https://127.0.0.1:[PORT]/lfs'
+    "#);
+    uv_snapshot!(filters, context.lock()
+        .args(["--no-preview", "--allow-insecure-host", "localhost"]), @r#"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+ssh://git@127.0.0.1:2222/repository.git@[COMMIT]#lfs=true`
+      cause: Git operation failed
+      cause: failed to fetch LFS objects at [COMMIT]
+      cause: process didn't exit successfully: `[GIT] lfs fetch 'ssh://git@127.0.0.1:2222/repository.git' [COMMIT]` (exit status: 2)
+             --- stderr
+             Fetching reference [COMMIT]
+             batch response: Post "https://127.0.0.1:[PORT]/lfs/objects/batch": tls: failed to verify certificate: x509: certificate signed by unknown authority
+             error: failed to fetch some objects from 'https://127.0.0.1:[PORT]/lfs'
+    "#);
+    let ssh_only = context.temp_dir.child("ssh-only.toml");
+    ssh_only.write_str(indoc! {r#"
+        allow-insecure-host = [{ scheme = "ssh", host = "127.0.0.1" }]
+    "#})?;
+    uv_snapshot!(filters, context.lock()
+        .args(["--no-preview", "--config-file"])
+        .arg(ssh_only.path()), @r#"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+ssh://git@127.0.0.1:2222/repository.git@[COMMIT]#lfs=true`
+      cause: Git operation failed
+      cause: failed to fetch LFS objects at [COMMIT]
+      cause: process didn't exit successfully: `[GIT] lfs fetch 'ssh://git@127.0.0.1:2222/repository.git' [COMMIT]` (exit status: 2)
+             --- stderr
+             Fetching reference [COMMIT]
+             batch response: Post "https://127.0.0.1:[PORT]/lfs/objects/batch": tls: failed to verify certificate: x509: certificate signed by unknown authority
+             error: failed to fetch some objects from 'https://127.0.0.1:[PORT]/lfs'
+    "#);
+    assert!(
+        server
+            .received_requests()
+            .await
+            .is_some_and(|requests| requests.is_empty())
+    );
+
+    uv_snapshot!(filters, context.lock()
+        .args(["--no-preview", "--allow-insecure-host", &endpoint_host]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+    let repository_url = RepositoryUrl::parse(url)?;
+    let checkout = context
+        .cache_dir
+        .child("git-v1/checkouts")
+        .child(cache_digest(&repository_url.with_lfs(Some(true))))
+        .child(short_revision);
+    assert_eq!(fs_err::read(checkout.child("module.py"))?, contents);
+    assert!(checkout.path().with_extension("ok").exists());
+    Ok(())
+}
+
+/// An explicit wildcard disables certificate verification for LFS object downloads on another HTTPS origin.
+#[tokio::test]
+#[cfg(all(feature = "test-git-lfs", unix))]
+async fn git_lfs_wildcard_https_object_origin() -> Result<()> {
+    use sha2::{Digest, Sha256};
+
+    let context = uv_test::test_context!("3.12")
+        .with_env("GIT_CONFIG_NOSYSTEM", "1")
+        .with_git_lfs_config();
+    let server = MockServer::start().await;
+    let (address, _shutdown) = https_proxy(*server.address())?;
+    let (object_address, _object_shutdown) = https_proxy(*server.address())?;
+    let endpoint_host = address.to_string();
+    let endpoint = format!("https://{endpoint_host}/lfs");
+    let contents = b"VALUE = True\n";
+    let oid = hex::encode(Sha256::digest(contents));
+    Mock::given(method("POST"))
+        .and(path("/lfs/objects/batch"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "transfer": "basic",
+            "objects": [{
+                "oid": oid,
+                "size": contents.len(),
+                "actions": {"download": {"href": format!("https://{object_address}/lfs/object")}}
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/lfs/object"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(contents.as_slice()))
+        .mount(&server)
+        .await;
+
+    let repository = context.temp_dir.child("repository");
+    repository.create_dir_all()?;
+    git(&context, repository.path(), &["init", "--template="])?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["lfs", "install", "--local", "--skip-repo"],
+    )?;
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+    "#})?;
+    repository
+        .child(".gitattributes")
+        .write_str("module.py filter=lfs diff=lfs merge=lfs -text\n")?;
+    repository
+        .child("module.py")
+        .write_str(str::from_utf8(contents)?)?;
+    git(&context, repository.path(), &["add", "."])?;
+    git(&context, repository.path(), &["commit", "-m", "LFS file"])?;
+    let revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let short_revision = git(
+        &context,
+        repository.path(),
+        &["rev-parse", "--short", "HEAD"],
+    )?;
+    let url = "ssh://git@127.0.0.1:2222/repository.git";
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency"]
+
+        [tool.uv.sources]
+        dependency = {{ git = "{url}", rev = "{revision}", lfs = true }}
+    "#})?;
+    let ssh = context.temp_dir.child("ssh");
+    ssh.write_str(indoc! {r#"
+        #!/bin/sh
+        for argument do
+            case "$argument" in
+                "git-upload-pack "*) exec git upload-pack "$UV_TEST_GIT_REPOSITORY" ;;
+            esac
+        done
+        exit 1
+    "#})?;
+    fs_err::set_permissions(ssh.path(), Permissions::from_mode(0o755))?;
+    let context = context
+        .with_env("GIT_SSH", ssh.path().as_os_str())
+        .with_env("GIT_SSH_VARIANT", "ssh")
+        .with_env("UV_TEST_GIT_REPOSITORY", repository.path().as_os_str())
+        .with_env("GIT_CONFIG_COUNT", "2")
+        .with_env("GIT_CONFIG_KEY_0", "lfs.url")
+        .with_env("GIT_CONFIG_VALUE_0", &endpoint)
+        .with_env("GIT_CONFIG_KEY_1", "lfs.transfer.maxretries")
+        .with_env("GIT_CONFIG_VALUE_1", "1")
+        .with_filter((regex::escape(&endpoint_host), "127.0.0.1:[BATCH_PORT]"))
+        .with_filter((
+            regex::escape(&object_address.to_string()),
+            "127.0.0.1:[OBJECT_PORT]",
+        ))
+        .with_filter((r"\b[0-9a-f]{64}\b", "[OBJECT]"))
+        .with_filter((r"\b[0-9a-f]{40}\b", "[COMMIT]"))
+        .with_filter((
+            regex::escape(&which::which("git")?.to_string_lossy()),
+            "[GIT]",
+        ));
+    let mut filters = context.filters();
+    filters.retain(|(_, replacement)| *replacement != "[LOCALHOST]");
+
+    uv_snapshot!(filters, context.lock()
+        .args(["--no-preview", "--allow-insecure-host", &endpoint_host]), @r#"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+ssh://git@127.0.0.1:2222/repository.git@[COMMIT]#lfs=true`
+      cause: Git operation failed
+      cause: failed to fetch LFS objects at [COMMIT]
+      cause: process didn't exit successfully: `[GIT] lfs fetch 'ssh://git@127.0.0.1:2222/repository.git' [COMMIT]` (exit status: 2)
+             --- stderr
+             Fetching reference [COMMIT]
+             LFS: Get "https://127.0.0.1:[OBJECT_PORT]/lfs/object": tls: failed to verify certificate: x509: certificate signed by unknown authority
+             error: failed to fetch some objects from 'https://127.0.0.1:[BATCH_PORT]/lfs'
+    "#);
+    assert!(server.received_requests().await.is_some_and(|requests| {
+        !requests.is_empty()
+            && requests
+                .iter()
+                .all(|request| request.url.path() == "/lfs/objects/batch")
+    }));
+
+    let wildcard_cache = context.temp_dir.child("wildcard-cache");
+    let context = context.with_cache_dir(wildcard_cache.path());
+    uv_snapshot!(context.filters(), context.lock()
+        .args(["--no-preview", "--allow-insecure-host", "*"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+    let repository_url = RepositoryUrl::parse(url)?;
+    let checkout = wildcard_cache
+        .child("git-v1/checkouts")
+        .child(cache_digest(&repository_url.with_lfs(Some(true))))
+        .child(short_revision);
+    assert_eq!(fs_err::read(checkout.child("module.py"))?, contents);
+    assert!(checkout.path().with_extension("ok").exists());
+    Ok(())
+}
+
+/// Offline checkout must not fetch submodule LFS objects from HTTP or SSH endpoints.
+#[tokio::test]
+#[cfg(feature = "test-git-lfs")]
+async fn git_offline_submodule_lfs_transport() -> Result<()> {
+    let context = uv_test::test_context!("3.12")
+        .with_env("GIT_CONFIG_NOSYSTEM", "1")
+        .with_git_lfs_config()
+        .with_env(EnvVars::GIT_LFS_SKIP_SMUDGE, "1")
+        .with_filter((r"\b[0-9a-f]{40}\b", "[COMMIT]"));
+    let endpoint = MockServer::start().await;
+    let submodule = context.temp_dir.child("submodule");
+    submodule.create_dir_all()?;
+    git(&context, submodule.path(), &["init", "--template="])?;
+    git(
+        &context,
+        submodule.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        submodule.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        submodule.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    git(
+        &context,
+        submodule.path(),
+        &["lfs", "install", "--local", "--skip-repo"],
+    )?;
+    submodule
+        .child(".gitattributes")
+        .write_str("module.py filter=lfs diff=lfs merge=lfs -text\n")?;
+    submodule
+        .child("module.py")
+        .write_str("SUBMODULE = True\n")?;
+    submodule
+        .child(".lfsconfig")
+        .write_str(&format!("[lfs]\nurl = {}\n", endpoint.uri()))?;
+    git(&context, submodule.path(), &["add", "."])?;
+    git(
+        &context,
+        submodule.path(),
+        &["commit", "-m", "Submodule LFS file"],
+    )?;
+
+    let repository = context.temp_dir.child("repository");
+    repository.create_dir_all()?;
+    git(&context, repository.path(), &["init", "--template="])?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["lfs", "install", "--local", "--skip-repo"],
+    )?;
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+    "#})?;
+    repository
+        .child(".gitattributes")
+        .write_str("module.py filter=lfs diff=lfs merge=lfs -text\n")?;
+    repository.child("module.py").write_str("ROOT = True\n")?;
+    git(
+        &context,
+        repository.path(),
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            "../submodule",
+            "submodule",
+        ],
+    )?;
+    git(&context, repository.path(), &["add", "."])?;
+    git(
+        &context,
+        repository.path(),
+        &["commit", "-m", "Root LFS file and submodule"],
+    )?;
+    let revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let short_revision = git(
+        &context,
+        repository.path(),
+        &["rev-parse", "--short", "HEAD"],
+    )?;
+    let url = SafeUrl::from_directory_path(repository.path())
+        .map_err(|()| anyhow!("invalid repository path"))?;
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency"]
+
+        [tool.uv.sources]
+        dependency = {{ git = "{url}", rev = "{revision}", lfs = true }}
+    "#})?;
+    let repository_url = RepositoryUrl::parse(url.as_str())?;
+    let checkout = context
+        .cache_dir
+        .child("git-v1/checkouts")
+        .child(cache_digest(&repository_url.with_lfs(Some(true))))
+        .child(&short_revision);
+
+    uv_snapshot!(context.filters(), context.lock()
+        .args(["--no-preview", "--offline"]), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+file://[TEMP_DIR]/repository/@[COMMIT]#lfs=true`
+      cause: Git operation failed
+      cause: Remote Git fetches are not allowed because network connectivity is disabled (i.e., with `--offline`)
+    ");
+    assert!(
+        endpoint
+            .received_requests()
+            .await
+            .is_some_and(|requests| requests.is_empty())
+    );
+    assert!(!checkout.path().with_extension("ok").exists());
+    #[cfg(unix)]
+    {
+        let ssh = context.temp_dir.child("ssh");
+        let sentinel = context.temp_dir.child("ssh-called");
+        ssh.write_str(indoc! {r#"
+            #!/bin/sh
+            printf called > "$UV_TEST_SSH_SENTINEL"
+            exit 1
+        "#})?;
+        fs_err::set_permissions(ssh.path(), Permissions::from_mode(0o755))?;
+        // Cached root objects let checkout reach the submodule endpoint check with an SSH URL.
+        uv_snapshot!(context.filters(), context.lock()
+            .args(["--no-preview", "--offline"])
+            .env("GIT_SSH", ssh.path())
+            .env("GIT_SSH_VARIANT", "ssh")
+            .env("UV_TEST_SSH_SENTINEL", sentinel.path())
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "lfs.url")
+            .env("GIT_CONFIG_VALUE_0", "ssh://git@localhost:2222/repository.git"), @"
+        exit_code: 1 (failure)
+        ----- stderr -----
+        error: Failed to download and build `dependency @ git+file://[TEMP_DIR]/repository/@[COMMIT]#lfs=true`
+          cause: Git operation failed
+          cause: Remote Git fetches are not allowed because network connectivity is disabled (i.e., with `--offline`)
+        ");
+        assert!(!sentinel.exists());
+        assert!(!checkout.path().with_extension("ok").exists());
+    }
+    Ok(())
+}
+
 /// Materialize cached submodule LFS pointers without configured smudge filters.
 #[test]
 #[cfg(feature = "test-git-lfs")]
@@ -1788,6 +2361,237 @@ fn git_lfs_submodule_ready_missing_objects() -> Result<()> {
     assert!(
         fs_err::read_to_string(checkout.child("submodule/module.py"))?
             .starts_with("version https://git-lfs.github.com/spec/v1\n")
+    );
+    Ok(())
+}
+
+/// An unsupported `git lfs fsck --objects` must not skip local transfers into a new submodule checkout.
+#[test]
+#[cfg(all(feature = "test-git-lfs", unix))]
+fn git_lfs_submodule_unsupported_validation() -> Result<()> {
+    let context = uv_test::test_context!("3.12")
+        .with_env("GIT_CONFIG_NOSYSTEM", "1")
+        .with_git_lfs_config();
+    let repository = context.temp_dir.child("repository");
+    repository.create_dir_all()?;
+    git(&context, repository.path(), &["init", "--template="])?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["lfs", "install", "--local", "--skip-repo"],
+    )?;
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+    "#})?;
+    repository
+        .child(".gitattributes")
+        .write_str("module.py filter=lfs diff=lfs merge=lfs -text\n")?;
+    repository.child("module.py").write_str("VALUE = True\n")?;
+    git(&context, repository.path(), &["add", "."])?;
+    git(&context, repository.path(), &["commit", "-m", "LFS file"])?;
+    let child_revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let url = SafeUrl::from_directory_path(repository.path())
+        .map_err(|()| anyhow!("invalid repository path"))?;
+    repository.child(".gitmodules").write_str(&formatdoc! {r#"
+        [submodule "child"]
+        path = child
+        url = {url}
+    "#})?;
+    git(
+        &context,
+        repository.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{child_revision},child"),
+        ],
+    )?;
+    git(&context, repository.path(), &["add", ".gitmodules"])?;
+    git(
+        &context,
+        repository.path(),
+        &["commit", "-m", "Add submodule"],
+    )?;
+    let revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let short_revision = git(
+        &context,
+        repository.path(),
+        &["rev-parse", "--short", "HEAD"],
+    )?;
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency"]
+
+        [tool.uv.sources]
+        dependency = {{ git = "{url}", rev = "{revision}", lfs = true }}
+    "#})?;
+    uv_snapshot!(context.filters(), context.lock()
+        .args(["--no-preview", "--offline"]), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    Resolved 2 packages in [TIME]
+    ");
+
+    // Recreate the checkout with cached parent objects while simulating an older Git LFS.
+    fs_err::remove_dir_all(context.cache_dir.child("git-v1/checkouts"))?;
+    fs_err::remove_file(context.temp_dir.child("uv.lock"))?;
+    fs_err::remove_dir_all(
+        Cache::from_path(context.cache_dir.path()).bucket(CacheBucket::SourceDistributions),
+    )?;
+    let wrapper = context.temp_dir.child("old-lfs");
+    wrapper.create_dir_all()?;
+    let git_wrapper = wrapper.child("git");
+    git_wrapper.write_str(indoc! {r#"
+        #!/bin/sh
+        if [ "$1 $2 $3" = "lfs fsck --objects" ]; then
+            printf 'unknown flag: --objects\n' >&2
+            exit 1
+        fi
+        PATH="$UV_TEST_GIT_PATH" exec git "$@"
+    "#})?;
+    fs_err::set_permissions(git_wrapper.path(), Permissions::from_mode(0o755))?;
+    let original_path = std::env::var_os("PATH").ok_or_else(|| anyhow!("PATH is missing"))?;
+    let path = std::env::join_paths(
+        std::iter::once(wrapper.path().to_path_buf()).chain(std::env::split_paths(&original_path)),
+    )?;
+    uv_snapshot!(context.filters(), context.lock()
+        .args(["--no-preview", "--offline"])
+        .env(EnvVars::PATH, path)
+        .env("UV_TEST_GIT_PATH", original_path), @"
+    exit_code: 0 (success)
+    ----- stderr -----
+    warning: Skipping Git LFS validation as Git LFS extension is outdated. Upgrade to `git-lfs>=3.0.2` or manually verify git-lfs objects were properly fetched after the current operation finishes.
+    Resolved 2 packages in [TIME]
+    ");
+    let repository_url = RepositoryUrl::parse(url.as_str())?;
+    let checkout = context
+        .cache_dir
+        .child("git-v1/checkouts")
+        .child(cache_digest(&repository_url.with_lfs(Some(true))))
+        .child(short_revision);
+    assert_eq!(
+        fs_err::read_to_string(checkout.child("module.py"))?,
+        "VALUE = True\n"
+    );
+    assert_eq!(
+        fs_err::read_to_string(checkout.child("child/module.py"))?,
+        "VALUE = True\n"
+    );
+    assert!(checkout.path().with_extension("ok").exists());
+    Ok(())
+}
+
+/// Offline checkouts must reject a network Git transport for a submodule after fetching a local parent.
+#[tokio::test]
+#[cfg(feature = "test-git")]
+async fn git_offline_submodule_transport() -> Result<()> {
+    let context = uv_test::test_context!("3.12").with_filter((r"\b[0-9a-f]{40}\b", "[COMMIT]"));
+    let endpoint = MockServer::start().await;
+    let repository = context.temp_dir.child("repository");
+    repository.create_dir_all()?;
+    git(&context, repository.path(), &["init", "--template="])?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.name", "Alice"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "user.email", "alice@example.com"],
+    )?;
+    git(
+        &context,
+        repository.path(),
+        &["config", "commit.gpgsign", "false"],
+    )?;
+    repository.child("pyproject.toml").write_str(indoc! {r#"
+        [project]
+        name = "dependency"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+    "#})?;
+    git(&context, repository.path(), &["add", "."])?;
+    git(
+        &context,
+        repository.path(),
+        &["commit", "-m", "Initial version"],
+    )?;
+    let child_revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    repository.child(".gitmodules").write_str(&formatdoc! {r#"
+        [submodule "child"]
+        path = child
+        url = {}/child.git
+    "#, endpoint.uri()})?;
+    // Add the gitlink directly so the fixture can name an HTTP remote without contacting it.
+    git(
+        &context,
+        repository.path(),
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{child_revision},child"),
+        ],
+    )?;
+    git(&context, repository.path(), &["add", ".gitmodules"])?;
+    git(
+        &context,
+        repository.path(),
+        &["commit", "-m", "Add remote submodule"],
+    )?;
+    let revision = git(&context, repository.path(), &["rev-parse", "HEAD"])?;
+    let url = SafeUrl::from_directory_path(repository.path())
+        .map_err(|()| anyhow!("invalid repository path"))?;
+    context
+        .temp_dir
+        .child("pyproject.toml")
+        .write_str(&formatdoc! {r#"
+        [project]
+        name = "project"
+        version = "0.1.0"
+        requires-python = ">=3.12"
+        dependencies = ["dependency @ git+{url}@{revision}"]
+    "#})?;
+
+    uv_snapshot!(context.filters(), context.lock()
+        .args(["--no-preview", "--offline"]), @"
+    exit_code: 1 (failure)
+    ----- stderr -----
+    error: Failed to download and build `dependency @ git+file://[TEMP_DIR]/repository/@[COMMIT]`
+      cause: Git operation failed
+      cause: Remote Git fetches are not allowed because network connectivity is disabled (i.e., with `--offline`)
+    ");
+    assert!(
+        endpoint
+            .received_requests()
+            .await
+            .is_some_and(|requests| requests.is_empty())
     );
     Ok(())
 }
